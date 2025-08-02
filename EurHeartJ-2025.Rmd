@@ -1,0 +1,148 @@
+---
+title: "Li F et al. Eur Heart J. 2025"
+output: html_document
+Sample: Aortic plaque macrophages (DAPI-CD45+CD11b+CD64+) sorted from Ctrl and M-LipaKI mice fed a Western diet for 16 weeks; 40M read depth.
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+##1. quantification using Salmon in Terminal
+```{}
+conda activate salmon
+salmon index -t gencode.vM33.transcripts.fa.gz -i gencode.vM33_salmon_1.10.2 --gencode
+
+nano shell.sh
+
+for fn in data/Ctl{1..5};
+ do
+ samp=`basename ${fn}`
+ echo "Processing sample ${samp}"
+ salmon quant -i gencode.vM33_salmon_1.10.2 -l A \
+         -1 ${fn}/${samp}_R1_001.fastq.gz \
+         -2 ${fn}/${samp}_R2_001.fastq.gz \
+         -p 8 --validateMappings --gcBias --biasSpeedSamp 5 -o quants/${samp}_quant
+done
+
+./shell.sh
+
+conda install -c bioconda -c conda-forge multiqc
+multiqc .  
+```         
+
+## 2. Load packages in R
+```{r init}
+library(devtools)
+library(BiocStyle)
+library(knitr)
+library(rmarkdown)
+library(dplyr)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+library(tximport)
+library(gplots)
+library(cowplot)
+library(shiny)
+```
+
+##3. Read in sample table
+```{r}
+coldata <- read.csv(paste0(wd$data, "sample.csv",  sep = ""), header = TRUE)
+head(coldata)
+colnames(coldata)
+idx <- c("id","subject","treatment", "batch")
+coldata[,idx]
+coldata
+
+coldata$subject <- as.factor(coldata$subject)
+coldata$treatment <- as.factor(coldata$treatment)
+coldata$batch <- as.factor(coldata$batch)
+```
+
+##4. Import quantification results from Salmon and summarize transcript-level estimates at both the transcript and gene levels using tximport
+```{r}
+files <- file.path(wd$data, "quants", coldata$id, "quant.sf")
+names(files) <- coldata$id
+all(file.exists(files))
+
+library(rtracklayer)
+library(GenomicFeatures)
+gtf <- paste0(wd$data, "gencode.vM33.annotation.gtf.gz")
+txdb.filename <- "gencode.vM33.annotation.sqlite"
+txdb <- makeTxDbFromGFF(gtf) 
+saveDb(txdb, txdb.filename)
+
+k <- keys(txdb, keytype = "TXNAME")
+tx2gene <- select(txdb, k, "GENEID", "TXNAME") #transcript-to-gene mapping
+```
+
+
+```{r}
+library("tximport")
+library("jsonlite")
+library("readr")
+
+txi <- tximport(files, type="salmon", tx2gene=tx2gene) # import couns via tximport
+names(txi)
+
+txi.tx <- tximport(files, type="salmon", txOut=TRUE, countsFromAbundance="scaledTPM") #scale counts based on TPM
+```
+
+##5. Differentially expression analysis using DEseq2
+```{r}
+library("DESeq2")
+
+dds <- DESeqDataSetFromTximport(txi, coldata, design = ~batch + treatment)
+dds <- dds[rowSums(counts(dds)) > 10, ]
+dds$treatment = relevel(dds$treatment, "Ctl")
+dds <- DESeq(dds) 
+res <- results(dds, contrast = c("treatment", "LipaTg", "Ctl")) 
+res <- lfcShrink(dds, coef = "treatment_LipaTg_vs_Ctl", type = "apeglm")
+resOrdered <- res[order(res$padj), ]
+write.csv(resOrdered, paste0(wd$output, "DEseq2.csv"))
+```
+
+##6. Annotate Ensembl gene IDs to gene symbols using AnnotationHub
+```{r}
+library(AnnotationDbi)
+library(AnnotationHub)
+library(dplyr)
+
+ah <- AnnotationHub()
+orgdb <- query(ah, c("Mus musculus", "OrgDb"))[[1]]
+
+# Merge gene symbols to DEseq2 table
+resOrdered <- read.csv(paste0(wd$output, "DEseq2.csv"))
+names(resOrdered)[1] <- paste("ENSEMBL")
+
+resOrdered$ENSEMBL <- sub("\\..*", "", resOrdered$ENSEMBL)
+
+
+resOrdered_annot = AnnotationDbi::select(orgdb, keys = resOrdered$ENSEMBL, columns=c("SYMBOL"), keytype="ENSEMBL")
+
+DE <- merge(resOrdered, resOrdered_annot, by = "ENSEMBL")
+DEnoNA <- DE %>% filter(!is.na(SYMBOL) & !is.na(pvalue) & !is.na(padj))
+write.csv(DEnoNA, file = paste0(wd$output, "DESeq2_SYMBOL.csv"))
+```
